@@ -1,25 +1,66 @@
 import streamlit as st
 import pandas as pd
 from io import BytesIO
+from pathlib import Path
+import os
 from allocation import recommend_for_line, normalize_text, find_column
 
 st.set_page_config(page_title="Sewing Line AI Allocation", page_icon="🧵", layout="wide")
 st.title("🧵 Sewing Line AI Operator Allocation")
-st.caption("Upload all required factory data, including Punching Machine Data, choose a line and attendance date, then click APPLY & ANALYSE.")
+st.caption("Upload master data once. It is saved for reuse; upload only the daily punching file for each allocation day.")
 
 def read_upload(upload):
     if upload is None: return None
     return pd.read_csv(upload) if upload.name.lower().endswith(".csv") else pd.read_excel(upload)
 
-with st.sidebar:
-    st.header("Upload your data")
-    skills_file = st.file_uploader("1. Employee Skills / Operation Skill Matrix", type=["xlsx","xls","csv"])
-    lines_file = st.file_uploader("2. Line Machine Details", type=["xlsx","xls","csv"])
-    eff_file = st.file_uploader("3. Employee Efficiency", type=["xlsx","xls","csv"])
-    req_file = st.file_uploader("4. Staffing Requirements (optional)", type=["xlsx","xls","csv"])
-    punch_file = st.file_uploader("5. Punching Machine Data (REQUIRED for allocation)", type=["xlsx","xls","csv"])
+# Persistent storage: on Render, mount a persistent disk at /var/data. Locally, use ./data/master_data.
+DATA_ROOT = Path("/var/data") if Path("/var/data").exists() and os.access("/var/data", os.W_OK) else Path(__file__).parent / "data"
+MASTER_DIR = DATA_ROOT / "master_data"
+MASTER_DIR.mkdir(parents=True, exist_ok=True)
+MASTER_FILES = {
+    "skills": ("Employee Skills / Operation Skill Matrix", "employee_skills"),
+    "lines": ("Line Machine Details", "line_machine_details"),
+    "eff": ("Employee Efficiency", "employee_efficiency"),
+    "req": ("Staffing Requirements (optional)", "staffing_requirements"),
+}
 
-skills, lines, eff, req, punches = map(read_upload, [skills_file, lines_file, eff_file, req_file, punch_file])
+def saved_master_path(key):
+    matches = list(MASTER_DIR.glob(f"{MASTER_FILES[key][1]}.*"))
+    return matches[0] if matches else None
+
+def load_saved_master(key):
+    path = saved_master_path(key)
+    if path is None: return None
+    return pd.read_csv(path) if path.suffix.lower() == ".csv" else pd.read_excel(path)
+
+def save_master_upload(key, upload):
+    if upload is None: return
+    stem = MASTER_FILES[key][1]
+    for old in MASTER_DIR.glob(f"{stem}.*"):
+        old.unlink()
+    suffix = Path(upload.name).suffix.lower()
+    target = MASTER_DIR / f"{stem}{suffix}"
+    target.write_bytes(upload.getvalue())
+
+with st.sidebar:
+    st.header("Master Data (upload once)")
+    st.caption("Master data is saved and reused automatically. Re-upload only when the master data changes.")
+    skills_file = st.file_uploader("1. Employee Skills / Operation Skill Matrix", type=["xlsx","xls","csv"], key="master_skills_upload")
+    lines_file = st.file_uploader("2. Line Machine Details", type=["xlsx","xls","csv"], key="master_lines_upload")
+    eff_file = st.file_uploader("3. Employee Efficiency", type=["xlsx","xls","csv"], key="master_eff_upload")
+    req_file = st.file_uploader("4. Staffing Requirements (optional)", type=["xlsx","xls","csv"], key="master_req_upload")
+    punch_file = st.file_uploader("5. Daily Punching Machine Data (upload each day)", type=["xlsx","xls","csv"], key="daily_punch_upload")
+
+for key, uploaded in [("skills", skills_file), ("lines", lines_file), ("eff", eff_file), ("req", req_file)]:
+    if uploaded is not None:
+        save_master_upload(key, uploaded)
+
+skills = read_upload(skills_file) if skills_file is not None else load_saved_master("skills")
+lines = read_upload(lines_file) if lines_file is not None else load_saved_master("lines")
+eff = read_upload(eff_file) if eff_file is not None else load_saved_master("eff")
+req = read_upload(req_file) if req_file is not None else load_saved_master("req")
+punches = read_upload(punch_file)
+
 if "page" not in st.session_state: st.session_state["page"] = "allocation"
 
 def get_roster(skills_df):
@@ -84,7 +125,7 @@ if st.session_state["page"]=="attendance":
     st.stop()
 
 if any(x is None for x in [skills,lines,eff]):
-    st.info("Upload Employee Skills, Line Machine Details, and Employee Efficiency to start.")
+    st.info("Upload Employee Skills, Line Machine Details, and Employee Efficiency once in the sidebar. Saved master data will load automatically on future visits.")
     st.markdown("**Punching Machine Data is compulsory for allocation.** Upload it to enable recommendations; only employees with punch records on the selected date can be allocated. Attendance Details can be opened separately.")
     if st.button("📋 ATTENDANCE DETAILS",use_container_width=True):
         st.session_state["page"]="attendance"; st.rerun()
@@ -103,11 +144,7 @@ except ValueError as e:
     st.error(str(e)); st.stop()
 
 line_values=sorted([x for x in lines[line_col].dropna().unique().tolist() if normalize_text(x).lower()!="grand total"],key=str)
-<<<<<<< HEAD
 selected_lines=st.multiselect("Select one or more sewing lines",line_values,default=[] ,help="Choose multiple lines for one allocation run. Each employee can be assigned to only one of the selected lines.")
-=======
-selected_line=st.selectbox("Select sewing line",line_values)
->>>>>>> 7ed376980eda079e94e5400f7bb31e455aceb63c
 
 allocation_date = None
 punched_employee_ids = None
@@ -116,17 +153,12 @@ if punches is not None:
         _, punch_dates, latest_punch_date = make_attendance(skills, punches)
         allocation_date = st.selectbox("Allocate using punch attendance date", punch_dates, index=len(punch_dates)-1)
         punched_employee_ids = punched_ids_for_date(punches, allocation_date)
-<<<<<<< HEAD
         st.info(f"Allocation will use only employees with punch records on {allocation_date}. Punched employees found: {len(punched_employee_ids)}. Each employee can be assigned to only one selected line.")
-=======
-        st.info(f"Allocation will use only employees with punch records on {allocation_date}. Punched employees found: {len(punched_employee_ids)}.")
->>>>>>> 7ed376980eda079e94e5400f7bb31e455aceb63c
     except Exception as e:
         st.error(f"Could not filter employees using punching data: {e}")
         st.stop()
 else:
     st.error("Punching Machine Data is compulsory. Upload the punch file in the sidebar before you can run employee allocation. APPLY & ANALYSE remains disabled until it is uploaded.")
-<<<<<<< HEAD
 
 if selected_lines:
     with st.expander("Selected line machine details", expanded=False):
@@ -145,32 +177,11 @@ if selected_lines:
 
 left,right=st.columns([2,1])
 with left: apply_clicked=st.button("🚀 APPLY & ANALYSE SELECTED LINES",type="primary",use_container_width=True, disabled=(punches is None or not selected_lines))
-=======
-try:
-    target=normalize_text(selected_line).lower()
-    line_rows=lines[lines[line_col].map(lambda x:normalize_text(x).lower())==target].copy()
-    try: machine_id_col=find_column(line_rows,["Machine ID","Machine No","Machine Number","Equipment ID"])
-    except ValueError: machine_id_col=None
-    try: count_col=find_column(line_rows,["Machine Count","Number of Machines","No. of Machines","Machines","Machine Qty","Qty"])
-    except ValueError: count_col=None
-    line_rows["_Machine Count"]=pd.to_numeric(line_rows[count_col],errors="coerce").fillna(0) if count_col else 1
-    op_summary=line_rows.groupby(machine_col,dropna=False)["_Machine Count"].sum().reset_index()
-    op_summary.columns=["Operation","Number of Machines"]
-    st.subheader(f"Selected line details — {selected_line}")
-    c1,c2=st.columns(2)
-    c1.metric("Different operations",len(op_summary)); c2.metric("Total machines",int(op_summary["Number of Machines"].sum()))
-    st.dataframe(op_summary,use_container_width=True,hide_index=True)
-except Exception as e: st.warning(f"Could not display machine summary: {e}")
-
-left,right=st.columns([2,1])
-with left: apply_clicked=st.button("🚀 APPLY & ANALYSE",type="primary",use_container_width=True, disabled=(punches is None))
->>>>>>> 7ed376980eda079e94e5400f7bb31e455aceb63c
 with right: attendance_clicked=st.button("📋 ATTENDANCE DETAILS",use_container_width=True)
 if attendance_clicked:
     st.session_state["page"]="attendance"; st.rerun()
 if apply_clicked:
     try:
-<<<<<<< HEAD
         all_results=[]
         all_summaries=[]
         already_assigned=set()
@@ -207,20 +218,3 @@ if st.session_state.get("multi_selected_lines")==list(selected_lines) and "multi
         r.to_excel(writer,index=False,sheet_name="Recommendations")
         summary_df.to_excel(writer,index=False,sheet_name="Line Summary")
     st.download_button("Download all recommendations (Excel)",buf.getvalue(),"multi_line_recommendations.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-=======
-        result,summary=recommend_for_line(selected_line,skills,lines,eff,req,line_col,machine_col,emp_id_sk,emp_name_sk,op_sk,skill_col,emp_id_eff,efficiency_col, eligible_employee_ids=punched_employee_ids)
-        st.session_state["result"]=result; st.session_state["summary"]=summary; st.session_state["selected_line"]=selected_line
-    except Exception as e: st.error(f"Could not calculate recommendations: {e}")
-if "result" in st.session_state and st.session_state.get("selected_line")==selected_line:
-    r=st.session_state["result"]; s=st.session_state["summary"]
-    st.header(f"Employee recommendations for {selected_line}")
-    a,b,c,d=st.columns(4)
-    a.metric("Required operator slots",s["required_slots"]); b.metric("Assigned employees",s["assigned"])
-    c.metric("Unfilled slots",s["unfilled"]); d.metric("Machines on line",s.get("machine_count",0))
-    if s.get("assumption"): st.warning(s["assumption"])
-    st.dataframe(r,use_container_width=True,hide_index=True)
-    st.download_button("Download recommendations (CSV)",r.to_csv(index=False).encode("utf-8-sig"),f"{normalize_text(selected_line).replace(' ','_')}_recommendations.csv","text/csv")
-    buf=BytesIO()
-    with pd.ExcelWriter(buf,engine="openpyxl") as writer:r.to_excel(writer,index=False,sheet_name="Recommendations")
-    st.download_button("Download recommendations (Excel)",buf.getvalue(),f"{normalize_text(selected_line).replace(' ','_')}_recommendations.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
->>>>>>> 7ed376980eda079e94e5400f7bb31e455aceb63c
