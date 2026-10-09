@@ -103,7 +103,11 @@ except ValueError as e:
     st.error(str(e)); st.stop()
 
 line_values=sorted([x for x in lines[line_col].dropna().unique().tolist() if normalize_text(x).lower()!="grand total"],key=str)
+<<<<<<< HEAD
+selected_lines=st.multiselect("Select one or more sewing lines",line_values,default=[] ,help="Choose multiple lines for one allocation run. Each employee can be assigned to only one of the selected lines.")
+=======
 selected_line=st.selectbox("Select sewing line",line_values)
+>>>>>>> 7ed376980eda079e94e5400f7bb31e455aceb63c
 
 allocation_date = None
 punched_employee_ids = None
@@ -112,12 +116,36 @@ if punches is not None:
         _, punch_dates, latest_punch_date = make_attendance(skills, punches)
         allocation_date = st.selectbox("Allocate using punch attendance date", punch_dates, index=len(punch_dates)-1)
         punched_employee_ids = punched_ids_for_date(punches, allocation_date)
+<<<<<<< HEAD
+        st.info(f"Allocation will use only employees with punch records on {allocation_date}. Punched employees found: {len(punched_employee_ids)}. Each employee can be assigned to only one selected line.")
+=======
         st.info(f"Allocation will use only employees with punch records on {allocation_date}. Punched employees found: {len(punched_employee_ids)}.")
+>>>>>>> 7ed376980eda079e94e5400f7bb31e455aceb63c
     except Exception as e:
         st.error(f"Could not filter employees using punching data: {e}")
         st.stop()
 else:
     st.error("Punching Machine Data is compulsory. Upload the punch file in the sidebar before you can run employee allocation. APPLY & ANALYSE remains disabled until it is uploaded.")
+<<<<<<< HEAD
+
+if selected_lines:
+    with st.expander("Selected line machine details", expanded=False):
+        for selected_line in selected_lines:
+            target=normalize_text(selected_line).lower()
+            line_rows=lines[lines[line_col].map(lambda x:normalize_text(x).lower())==target].copy()
+            try:
+                count_col=find_column(line_rows,["Machine Count","Number of Machines","No. of Machines","Machines","Machine Qty","Qty"])
+            except ValueError:
+                count_col=None
+            line_rows["_Machine Count"]=pd.to_numeric(line_rows[count_col],errors="coerce").fillna(0) if count_col else 1
+            op_summary=line_rows.groupby(machine_col,dropna=False)["_Machine Count"].sum().reset_index()
+            op_summary.columns=["Operation","Number of Machines"]
+            st.markdown(f"**{selected_line}** — {int(op_summary['Number of Machines'].sum())} machines")
+            st.dataframe(op_summary,use_container_width=True,hide_index=True)
+
+left,right=st.columns([2,1])
+with left: apply_clicked=st.button("🚀 APPLY & ANALYSE SELECTED LINES",type="primary",use_container_width=True, disabled=(punches is None or not selected_lines))
+=======
 try:
     target=normalize_text(selected_line).lower()
     line_rows=lines[lines[line_col].map(lambda x:normalize_text(x).lower())==target].copy()
@@ -136,11 +164,50 @@ except Exception as e: st.warning(f"Could not display machine summary: {e}")
 
 left,right=st.columns([2,1])
 with left: apply_clicked=st.button("🚀 APPLY & ANALYSE",type="primary",use_container_width=True, disabled=(punches is None))
+>>>>>>> 7ed376980eda079e94e5400f7bb31e455aceb63c
 with right: attendance_clicked=st.button("📋 ATTENDANCE DETAILS",use_container_width=True)
 if attendance_clicked:
     st.session_state["page"]="attendance"; st.rerun()
 if apply_clicked:
     try:
+<<<<<<< HEAD
+        all_results=[]
+        all_summaries=[]
+        already_assigned=set()
+        for selected_line in selected_lines:
+            result,summary=recommend_for_line(selected_line,skills,lines,eff,req,line_col,machine_col,emp_id_sk,emp_name_sk,op_sk,skill_col,emp_id_eff,efficiency_col, eligible_employee_ids=punched_employee_ids, excluded_employee_ids=already_assigned)
+            assigned_ids=set(result.loc[result["Status"]=="Recommended","Employee ID"].map(normalize_text))
+            already_assigned.update(x for x in assigned_ids if x)
+            all_results.append(result)
+            all_summaries.append({"Line":selected_line,**summary})
+        combined=pd.concat(all_results,ignore_index=True) if all_results else pd.DataFrame()
+        st.session_state["multi_result"]=combined
+        st.session_state["multi_summary"]=pd.DataFrame(all_summaries)
+        st.session_state["multi_selected_lines"]=list(selected_lines)
+        st.session_state["multi_allocation_date"]=allocation_date
+    except Exception as e:
+        st.error(f"Could not calculate recommendations: {e}")
+
+if st.session_state.get("multi_selected_lines")==list(selected_lines) and "multi_result" in st.session_state:
+    r=st.session_state["multi_result"]
+    summary_df=st.session_state["multi_summary"]
+    st.header("Employee recommendations across selected lines")
+    a,b,c=st.columns(3)
+    a.metric("Selected lines",len(selected_lines))
+    b.metric("Total assigned employees",int((r["Status"]=="Recommended").sum()))
+    c.metric("Unfilled operator slots",int((r["Status"]=="Unfilled").sum()))
+    st.caption("Employees are allocated in the order of selected lines. Once assigned to one line, an employee is excluded from every subsequent selected line in this run.")
+    st.subheader("Line summary")
+    st.dataframe(summary_df,use_container_width=True,hide_index=True)
+    st.subheader("All line recommendations")
+    st.dataframe(r,use_container_width=True,hide_index=True)
+    st.download_button("Download all recommendations (CSV)",r.to_csv(index=False).encode("utf-8-sig"),"multi_line_recommendations.csv","text/csv")
+    buf=BytesIO()
+    with pd.ExcelWriter(buf,engine="openpyxl") as writer:
+        r.to_excel(writer,index=False,sheet_name="Recommendations")
+        summary_df.to_excel(writer,index=False,sheet_name="Line Summary")
+    st.download_button("Download all recommendations (Excel)",buf.getvalue(),"multi_line_recommendations.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+=======
         result,summary=recommend_for_line(selected_line,skills,lines,eff,req,line_col,machine_col,emp_id_sk,emp_name_sk,op_sk,skill_col,emp_id_eff,efficiency_col, eligible_employee_ids=punched_employee_ids)
         st.session_state["result"]=result; st.session_state["summary"]=summary; st.session_state["selected_line"]=selected_line
     except Exception as e: st.error(f"Could not calculate recommendations: {e}")
@@ -156,3 +223,4 @@ if "result" in st.session_state and st.session_state.get("selected_line")==selec
     buf=BytesIO()
     with pd.ExcelWriter(buf,engine="openpyxl") as writer:r.to_excel(writer,index=False,sheet_name="Recommendations")
     st.download_button("Download recommendations (Excel)",buf.getvalue(),f"{normalize_text(selected_line).replace(' ','_')}_recommendations.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+>>>>>>> 7ed376980eda079e94e5400f7bb31e455aceb63c

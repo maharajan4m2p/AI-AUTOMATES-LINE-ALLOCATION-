@@ -27,7 +27,11 @@ def is_yes(v):
 def to_num(s):
     return pd.to_numeric(s.astype(str).str.replace("%", "", regex=False).str.replace(",", "", regex=False).str.strip(), errors="coerce")
 
+<<<<<<< HEAD
+def recommend_for_line(selected_line, skills, lines, efficiency, requirements, line_col, machine_col, skill_id_col, skill_name_col, skill_op_col, skill_status_col, eff_id_col, eff_col, eligible_employee_ids=None, excluded_employee_ids=None):
+=======
 def recommend_for_line(selected_line, skills, lines, efficiency, requirements, line_col, machine_col, skill_id_col, skill_name_col, skill_op_col, skill_status_col, eff_id_col, eff_col, eligible_employee_ids=None):
+>>>>>>> 7ed376980eda079e94e5400f7bb31e455aceb63c
     target = normalize_text(selected_line).lower()
     line_rows = lines[lines[line_col].map(lambda x: normalize_text(x).lower()) == target].copy()
     line_rows = line_rows[line_rows[machine_col].notna()]
@@ -98,13 +102,25 @@ def recommend_for_line(selected_line, skills, lines, efficiency, requirements, l
     eff_by = ef[ef["_id"] != ""].groupby("_id")["_eff"].max()
     emp = sk[sk["_id"] != ""].drop_duplicates("_id").sort_values("_name")[["_id", "_name"]].copy()
     emp["_eff"] = emp["_id"].map(eff_by).fillna(0).clip(0, 100)
+<<<<<<< HEAD
+    if emp.empty:
+        raise ValueError("No employees found in Employee Skills.")
+=======
+>>>>>>> 7ed376980eda079e94e5400f7bb31e455aceb63c
     if eligible_employee_ids is not None:
         allowed = {normalize_text(x) for x in eligible_employee_ids}
         emp = emp[emp["_id"].isin(allowed)].copy()
         if emp.empty:
             raise ValueError("No employees have punch records on the selected date. Check the punching data or choose another date.")
+<<<<<<< HEAD
+    # Employees assigned to an earlier selected line cannot be reused on another line.
+    if excluded_employee_ids:
+        excluded = {normalize_text(x) for x in excluded_employee_ids}
+        emp = emp[~emp["_id"].isin(excluded)].copy()
+=======
     if emp.empty:
         raise ValueError("No employees found in Employee Skills.")
+>>>>>>> 7ed376980eda079e94e5400f7bb31e455aceb63c
     eligible = set(zip(sk.loc[sk["_yes"], "_id"], sk.loc[sk["_yes"], "_op"].str.lower()))
 
     n, m = len(emp), len(slots)
