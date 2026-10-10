@@ -3,7 +3,7 @@ import pandas as pd
 from io import BytesIO
 from pathlib import Path
 import os
-from allocation import recommend_for_line, normalize_text, normalize_id, find_column
+from allocation import recommend_for_lines, normalize_text, normalize_id, normalize_operation, find_column
 
 st.set_page_config(page_title="Sewing Line AI Allocation", page_icon="🧵", layout="wide")
 st.title("🧵 Sewing Line AI Operator Allocation")
@@ -153,7 +153,7 @@ if any(x is None for x in [skills,lines,eff]):
 
 try:
     line_col=find_column(lines,["Line","Candidate Line"])
-    machine_col=find_column(lines,["Machine Type","Operation","Required Operation"])
+    machine_col=find_column(lines,["Operation","Required Operation","Machine Type"])
     emp_id_sk=find_column(skills,["Employee ID","Emp ID","EmployeeID"])
     emp_name_sk=find_column(skills,["Employee Name","Name","Employee"])
     op_sk=find_column(skills,["Operation","Machine Type","Skill Operation"])
@@ -164,6 +164,22 @@ except ValueError as e:
     st.error(str(e)); st.stop()
 
 line_values=sorted([x for x in lines[line_col].dropna().unique().tolist() if normalize_text(x).lower()!="grand total"],key=str)
+# Strict operation diagnostics: never silently treat unrelated operations as equivalent.
+try:
+    _skill_ops = {normalize_operation(x) for x in skills[op_sk].dropna() if normalize_operation(x)}
+    _approved_map = {}
+    if operation_mapping is not None and not operation_mapping.empty:
+        _mc = find_column(operation_mapping, ["Machine Operation", "Machine Type", "Operation"])
+        _sc = find_column(operation_mapping, ["Skill Operation", "Approved Skill Operation", "Employee Skill Operation"])
+        for _, _mr in operation_mapping.iterrows():
+            _mk, _sk = normalize_operation(_mr[_mc]), normalize_operation(_mr[_sc])
+            if _mk and _sk: _approved_map.setdefault(_mk, set()).add(_sk)
+    _machine_ops = sorted({normalize_text(x) for x in lines[machine_col].dropna() if normalize_text(x)})
+    _unmapped_ops = [x for x in _machine_ops if normalize_operation(x) not in _skill_ops and not (_approved_map.get(normalize_operation(x), set()) & _skill_ops)]
+    if _unmapped_ops:
+        st.warning("Strict skill matching: these machine operations have no exact skill-name match or verified mapping: " + ", ".join(_unmapped_ops) + ". Their slots will remain unfilled until you add verified rows to 05_Operation_Mapping.xlsx or align the master operation names.")
+except Exception:
+    pass
 selected_lines=st.multiselect("Select one or more sewing lines",line_values,default=[] ,help="Choose multiple lines for one allocation run. Each employee can be assigned to only one of the selected lines.")
 
 allocation_date = None
@@ -233,43 +249,17 @@ if attendance_clicked:
     st.session_state["page"]="attendance"; st.rerun()
 if apply_clicked:
     try:
-        all_results=[]
-        all_summaries=[]
-        already_assigned=set()
-
-        # Process smaller lines first to reduce starvation of lines selected later.
-        def _estimated_slots(_line):
-            _target = normalize_text(_line).lower()
-            _lr = lines[lines[line_col].map(lambda x: normalize_text(x).lower()) == _target]
-            try:
-                _rline = find_column(req, ["Line", "Candidate Line"]) if req is not None else None
-                _rop = find_column(req, ["Operation", "Machine Type", "Required Operation"]) if req is not None else None
-                _rcount = find_column(req, ["Operators Required", "Required Operators", "Operator Count", "Slots"]) if req is not None else None
-                if req is not None:
-                    _rr = req[req[_rline].map(lambda x: normalize_text(x).lower()) == _target]
-                    _n = pd.to_numeric(_rr[_rcount], errors="coerce").fillna(0).clip(lower=0).sum()
-                    if _n > 0:
-                        return int(_n)
-            except Exception:
-                pass
-            try:
-                _count = find_column(_lr, ["Machine Count", "Number of Machines", "No. of Machines", "Machines", "Machine Qty", "Qty"])
-                return int(pd.to_numeric(_lr[_count], errors="coerce").fillna(0).clip(lower=0).sum())
-            except Exception:
-                return len(_lr)
-
-        allocation_order = sorted(selected_lines, key=lambda _x: (_estimated_slots(_x), normalize_text(_x).lower()))
-        for selected_line in allocation_order:
-            result,summary=recommend_for_line(selected_line,skills,lines,eff,req,line_col,machine_col,emp_id_sk,emp_name_sk,op_sk,skill_col,emp_id_eff,efficiency_col, eligible_employee_ids=punched_employee_ids, excluded_employee_ids=already_assigned)
-            assigned_ids=set(result.loc[result["Status"]=="Recommended","Employee ID"].map(normalize_id))
-            already_assigned.update(x for x in assigned_ids if x)
-            all_results.append(result)
-            all_summaries.append({"Line":selected_line,**summary})
-        combined=pd.concat(all_results,ignore_index=True) if all_results else pd.DataFrame()
-        st.session_state["multi_result"]=combined
-        st.session_state["multi_summary"]=pd.DataFrame(all_summaries)
-        st.session_state["multi_selected_lines"]=list(selected_lines)
-        st.session_state["multi_allocation_date"]=allocation_date
+        combined, summary_df = recommend_for_lines(
+            selected_lines, skills, lines, eff, req,
+            line_col, machine_col, emp_id_sk, emp_name_sk, op_sk, skill_col,
+            emp_id_eff, efficiency_col,
+            eligible_employee_ids=punched_employee_ids,
+            operation_mapping=operation_mapping,
+        )
+        st.session_state["multi_result"] = combined
+        st.session_state["multi_summary"] = summary_df
+        st.session_state["multi_selected_lines"] = list(selected_lines)
+        st.session_state["multi_allocation_date"] = allocation_date
     except Exception as e:
         st.error(f"Could not calculate recommendations: {e}")
 
@@ -281,7 +271,7 @@ if st.session_state.get("multi_selected_lines")==list(selected_lines) and "multi
     a.metric("Selected lines",len(selected_lines))
     b.metric("Total assigned employees",int((r["Status"]=="Recommended").sum()))
     c.metric("Unfilled operator slots",int((r["Status"]=="Unfilled").sum()))
-    st.caption("Lines with fewer required slots are allocated first to reduce starvation. Each assigned employee is excluded from every other selected line in this run.")
+    st.caption("Allocation is optimized across all selected lines together. Assignments are balanced across lines where qualifications allow; each employee can be assigned to only one machine.")
     st.subheader("Line summary")
     st.dataframe(summary_df,use_container_width=True,hide_index=True)
     st.subheader("All line recommendations")
