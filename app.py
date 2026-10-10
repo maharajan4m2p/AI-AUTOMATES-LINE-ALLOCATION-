@@ -3,7 +3,7 @@ import pandas as pd
 from io import BytesIO
 from pathlib import Path
 import os
-from allocation import recommend_for_line, normalize_text, find_column
+from allocation import recommend_for_line, normalize_text, normalize_id, find_column
 
 st.set_page_config(page_title="Sewing Line AI Allocation", page_icon="🧵", layout="wide")
 st.title("🧵 Sewing Line AI Operator Allocation")
@@ -11,55 +11,131 @@ st.caption("Upload master data once. It is saved for reuse; upload only the dail
 
 def read_upload(upload):
     if upload is None: return None
-    return pd.read_csv(upload) if upload.name.lower().endswith(".csv") else pd.read_excel(upload)
+    name = upload.name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(upload)
+    if name.endswith(".ods"):
+        return pd.read_excel(upload, engine="odf")
+    return pd.read_excel(upload)
 
-# Persistent storage: on Render, mount a persistent disk at /var/data. Locally, use ./data/master_data.
-DATA_ROOT = Path("/var/data") if Path("/var/data").exists() and os.access("/var/data", os.W_OK) else Path(__file__).parent / "data"
+# Master data: bundled defaults + optional Supabase persistence.
+# Master upload controls are intentionally hidden; only daily punching is uploaded.
+DATA_ROOT = Path(__file__).parent / "data"
 MASTER_DIR = DATA_ROOT / "master_data"
 MASTER_DIR.mkdir(parents=True, exist_ok=True)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "sewing-master-data").strip()
+supabase_client = None
+supabase_error = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        from supabase import create_client
+        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as exc:
+        supabase_error = str(exc)
+
 MASTER_FILES = {
-    "skills": ("Employee Skills / Operation Skill Matrix", "employee_skills"),
-    "lines": ("Line Machine Details", "line_machine_details"),
-    "eff": ("Employee Efficiency", "employee_efficiency"),
-    "req": ("Staffing Requirements (optional)", "staffing_requirements"),
+    "employee": ("Employee Details Master", "employee_details", "Employee_Details_Master.xlsx"),
+    "skills": ("Employee Skills / Operation Skill Matrix", "employee_skills", "01_Employee_Skills.xlsx"),
+    "lines": ("Line Machine Details", "line_machine_details", "02_Line_Machine_Details.xlsx"),
+    "eff": ("Employee Efficiency", "employee_efficiency", "03_Employee_Efficiency.xlsx"),
+    "req": ("Staffing Requirements (optional)", "staffing_requirements", "04_Staffing_Requirements.xlsx"),
 }
 
-def saved_master_path(key):
-    matches = list(MASTER_DIR.glob(f"{MASTER_FILES[key][1]}.*"))
-    return matches[0] if matches else None
+def _parse_master_bytes(data, filename):
+    lower = filename.lower()
+    if lower.endswith(".csv"):
+        return pd.read_csv(BytesIO(data))
+    if lower.endswith(".ods"):
+        return pd.read_excel(BytesIO(data), engine="odf")
+    return pd.read_excel(BytesIO(data))
+
+def _remote_download(key):
+    if supabase_client is None:
+        return None
+    stem = MASTER_FILES[key][1]
+    try:
+        listing = supabase_client.storage.from_(SUPABASE_BUCKET).list()
+        match = next((item for item in listing if str(item.get("name", "")).startswith(stem + ".")), None)
+        if match:
+            filename = match["name"]
+            data = supabase_client.storage.from_(SUPABASE_BUCKET).download(filename)
+            return data, filename
+    except Exception:
+        return None
+    return None
 
 def load_saved_master(key):
-    path = saved_master_path(key)
-    if path is None: return None
-    return pd.read_csv(path) if path.suffix.lower() == ".csv" else pd.read_excel(path)
-
-def save_master_upload(key, upload):
-    if upload is None: return
+    # Cloud copy wins; otherwise local saved copy; otherwise bundled starter file.
+    remote = _remote_download(key)
+    if remote:
+        data, filename = remote
+        return _parse_master_bytes(data, filename)
     stem = MASTER_FILES[key][1]
-    for old in MASTER_DIR.glob(f"{stem}.*"):
-        old.unlink()
-    suffix = Path(upload.name).suffix.lower()
-    target = MASTER_DIR / f"{stem}{suffix}"
-    target.write_bytes(upload.getvalue())
+    matches = list(MASTER_DIR.glob(f"{stem}.*"))
+    if matches:
+        path = matches[0]
+        return pd.read_csv(path) if path.suffix.lower() == ".csv" else pd.read_excel(path)
+    bundled = Path(__file__).parent / MASTER_FILES[key][2]
+    if bundled.exists():
+        return pd.read_excel(bundled)
+    return None
+
+def seed_bundled_masters_to_cloud():
+    if supabase_client is None:
+        return
+    bucket = supabase_client.storage.from_(SUPABASE_BUCKET)
+    try:
+        listing = bucket.list()
+    except Exception as exc:
+        st.sidebar.warning(f"Supabase bucket unavailable. Check that the private bucket '{SUPABASE_BUCKET}' exists: {exc}")
+        return
+    names = {str(item.get("name", "")) for item in listing}
+    for key, (_, stem, bundled_name) in MASTER_FILES.items():
+        target = Path(__file__).parent / bundled_name
+        if not target.exists() or any(name.startswith(stem + ".") for name in names):
+            continue
+        try:
+            bucket.upload(
+                path=f"{stem}.xlsx",
+                file=target.read_bytes(),
+                file_options={"upsert": "true", "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+            )
+            names.add(f"{stem}.xlsx")
+        except Exception as exc:
+            st.sidebar.warning(f"Could not initialize {MASTER_FILES[key][0]} in Supabase: {exc}")
 
 with st.sidebar:
-    st.header("Master Data (upload once)")
-    st.caption("Master data is saved and reused automatically. Re-upload only when the master data changes.")
-    skills_file = st.file_uploader("1. Employee Skills / Operation Skill Matrix", type=["xlsx","xls","csv"], key="master_skills_upload")
-    lines_file = st.file_uploader("2. Line Machine Details", type=["xlsx","xls","csv"], key="master_lines_upload")
-    eff_file = st.file_uploader("3. Employee Efficiency", type=["xlsx","xls","csv"], key="master_eff_upload")
-    req_file = st.file_uploader("4. Staffing Requirements (optional)", type=["xlsx","xls","csv"], key="master_req_upload")
-    punch_file = st.file_uploader("5. Daily Punching Machine Data (upload each day)", type=["xlsx","xls","csv"], key="daily_punch_upload")
+    st.header("Daily Allocation")
+    st.caption("Master data is preloaded. Upload only today's punching data.")
+    punch_file = st.file_uploader("Daily Punching Machine Data", type=["xlsx", "xls", "csv", "ods"], key="daily_punch_upload")
+    if supabase_client is None:
+        if not (SUPABASE_URL and SUPABASE_KEY):
+            st.info("Master files are bundled in this project. For persistence across Render restarts/redeployments, configure SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY and SUPABASE_STORAGE_BUCKET in Render.")
+        else:
+            st.warning(f"Supabase connection could not be initialized: {supabase_error}")
+    else:
+        seed_bundled_masters_to_cloud()
+        st.success("Cloud storage connected. Master data is saved for reuse.")
 
-for key, uploaded in [("skills", skills_file), ("lines", lines_file), ("eff", eff_file), ("req", req_file)]:
-    if uploaded is not None:
-        save_master_upload(key, uploaded)
+punches = None
+if punch_file is not None:
+    try:
+        if punch_file.name.lower().endswith(".csv"):
+            punches = pd.read_csv(punch_file)
+        elif punch_file.name.lower().endswith(".ods"):
+            punches = pd.read_excel(punch_file, engine="odf")
+        else:
+            punches = pd.read_excel(punch_file)
+    except Exception as exc:
+        st.error(f"Could not read daily punching file: {exc}")
 
-skills = read_upload(skills_file) if skills_file is not None else load_saved_master("skills")
-lines = read_upload(lines_file) if lines_file is not None else load_saved_master("lines")
-eff = read_upload(eff_file) if eff_file is not None else load_saved_master("eff")
-req = read_upload(req_file) if req_file is not None else load_saved_master("req")
-punches = read_upload(punch_file)
+employee_master = load_saved_master("employee")
+skills = load_saved_master("skills")
+lines = load_saved_master("lines")
+eff = load_saved_master("eff")
+req = load_saved_master("req")
 
 if "page" not in st.session_state: st.session_state["page"] = "allocation"
 
@@ -69,26 +145,26 @@ def get_roster(skills_df):
     return skills_df[[idc,namec]].rename(columns={idc:"Employee ID",namec:"Employee Name"}).dropna(subset=["Employee ID"]).drop_duplicates("Employee ID")
 
 def punched_ids_for_date(punch_df, date_choice):
-    pid = find_column(punch_df, ["Employee ID","Emp ID","EmployeeID"])
+    pid = find_column(punch_df, ["Employee ID","Emp ID","EmployeeID","Emp Code","Employee Code","Employee No","Emp No","Employee Number"])
     datec = find_column(punch_df, ["Punch Date","Date","Attendance Date","Log Date"])
     temp = punch_df.copy()
-    temp["_id"] = temp[pid].map(normalize_text)
+    temp["_id"] = temp[pid].map(normalize_id)
     temp["_date"] = pd.to_datetime(temp[datec], errors="coerce", dayfirst=True).dt.strftime("%Y-%m-%d")
     chosen = pd.to_datetime(date_choice).strftime("%Y-%m-%d")
     return set(temp.loc[temp["_date"] == chosen, "_id"].dropna().tolist())
 
 def make_attendance(skills_df,punch_df,date_choice=None):
     roster=get_roster(skills_df)
-    pid=find_column(punch_df,["Employee ID","Emp ID","EmployeeID"])
+    pid=find_column(punch_df,["Employee ID","Emp ID","EmployeeID","Emp Code","Employee Code","Employee No","Emp No","Employee Number"])
     datec=find_column(punch_df,["Punch Date","Date","Attendance Date","Log Date"])
     pn=punch_df.copy()
-    pn["_id"]=pn[pid].map(normalize_text)
+    pn["_id"]=pn[pid].map(normalize_id)
     pn["_date"]=pd.to_datetime(pn[datec],errors="coerce",dayfirst=True).dt.strftime("%Y-%m-%d")
     dates=sorted(pn["_date"].dropna().unique().tolist())
     if not dates: raise ValueError("No valid punch dates found.")
     selected=pd.to_datetime(date_choice or dates[-1]).strftime("%Y-%m-%d")
     daily=pn[pn["_date"]==selected]
-    roster["Employee ID"]=roster["Employee ID"].map(normalize_text)
+    roster["Employee ID"]=roster["Employee ID"].map(normalize_id)
     roster["Attendance Date"]=selected
     present=set(daily["_id"])
     roster["Attendance Status"]=roster["Employee ID"].map(lambda x:"Present" if x in present else "Absent")
@@ -137,9 +213,9 @@ try:
     emp_id_sk=find_column(skills,["Employee ID","Emp ID","EmployeeID"])
     emp_name_sk=find_column(skills,["Employee Name","Name","Employee"])
     op_sk=find_column(skills,["Operation","Machine Type","Skill Operation"])
-    skill_col=find_column(skills,["Skill","Skill Status","Knowledge","YES/NO"])
+    skill_col=find_column(skills,["Skill","Skill Status","Knowledge","YES/NO","Skill Score","Score"])
     emp_id_eff=find_column(eff,["Employee ID","Emp ID","EmployeeID"])
-    efficiency_col=find_column(eff,["Avg Efficiency","Avg Eff (%)","Avg Eff","Efficiency","Average Efficiency"])
+    efficiency_col=find_column(eff,["Avg Efficiency","Avg Eff (%)","Avg Eff","Efficiency","Average Efficiency","Average Efficiency (%)","Average Efficiency (Source Ratio)"])
 except ValueError as e:
     st.error(str(e)); st.stop()
 
@@ -153,12 +229,43 @@ if punches is not None:
         _, punch_dates, latest_punch_date = make_attendance(skills, punches)
         allocation_date = st.selectbox("Allocate using punch attendance date", punch_dates, index=len(punch_dates)-1)
         punched_employee_ids = punched_ids_for_date(punches, allocation_date)
-        st.info(f"Allocation will use only employees with punch records on {allocation_date}. Punched employees found: {len(punched_employee_ids)}. Each employee can be assigned to only one selected line.")
+        skill_ids = set(skills[emp_id_sk].map(normalize_id)) if "emp_id_sk" in globals() else set()
+        # emp_id_sk is detected later in the script, so calculate overlap using common ID column names here.
+        try:
+            _sid_col = find_column(skills, ["Employee ID", "Emp ID", "EmployeeID"])
+            _skill_ids = {normalize_id(x) for x in skills[_sid_col].dropna()}
+            _overlap = len(_skill_ids.intersection(punched_employee_ids))
+            st.info(f"Allocation date: {allocation_date}. Punch records found: {len(punched_employee_ids)} unique IDs; IDs matching the skill matrix: {_overlap}. Each employee can be assigned to only one selected line.")
+            if _overlap == 0:
+                st.error("No punched employee IDs match the skill matrix. Check that today's punching file uses the same employee IDs as Employee_Skill_Data.xlsx.")
+            elif _overlap < len(punched_employee_ids):
+                st.warning(f"{len(punched_employee_ids) - _overlap} punched employee IDs do not exist in the skill matrix and cannot be allocated. Check ID formats or refresh the skill master.")
+        except Exception:
+            st.info(f"Allocation will use only employees with punch records on {allocation_date}. Punched employees found: {len(punched_employee_ids)}. Each employee can be assigned to only one selected line.")
     except Exception as e:
         st.error(f"Could not filter employees using punching data: {e}")
         st.stop()
 else:
     st.error("Punching Machine Data is compulsory. Upload the punch file in the sidebar before you can run employee allocation. APPLY & ANALYSE remains disabled until it is uploaded.")
+
+if selected_lines and punched_employee_ids is not None and lines is not None:
+    try:
+        total_required = 0
+        for _line in selected_lines:
+            _lr = lines[lines[line_col].map(lambda x: normalize_text(x).lower()) == normalize_text(_line).lower()]
+            _count_col = None
+            try:
+                _count_col = find_column(_lr, ["Machine Count", "Number of Machines", "No. of Machines", "Machines", "Machine Qty", "Qty"])
+            except ValueError:
+                pass
+            if _count_col:
+                total_required += int(pd.to_numeric(_lr[_count_col], errors="coerce").fillna(0).clip(lower=0).sum())
+            else:
+                total_required += len(_lr)
+        if len(punched_employee_ids) < total_required:
+            st.warning(f"Capacity check: {len(punched_employee_ids)} unique employees punched in, while selected lines require approximately {total_required} operator slots (one per machine). All slots cannot be filled unless staffing requirements are lower or more employees are present. The app will assign available eligible employees without duplicating them.")
+    except Exception:
+        pass
 
 if selected_lines:
     with st.expander("Selected line machine details", expanded=False):
@@ -185,9 +292,32 @@ if apply_clicked:
         all_results=[]
         all_summaries=[]
         already_assigned=set()
-        for selected_line in selected_lines:
+
+        # Process smaller lines first to reduce starvation of lines selected later.
+        def _estimated_slots(_line):
+            _target = normalize_text(_line).lower()
+            _lr = lines[lines[line_col].map(lambda x: normalize_text(x).lower()) == _target]
+            try:
+                _rline = find_column(req, ["Line", "Candidate Line"]) if req is not None else None
+                _rop = find_column(req, ["Operation", "Machine Type", "Required Operation"]) if req is not None else None
+                _rcount = find_column(req, ["Operators Required", "Required Operators", "Operator Count", "Slots"]) if req is not None else None
+                if req is not None:
+                    _rr = req[req[_rline].map(lambda x: normalize_text(x).lower()) == _target]
+                    _n = pd.to_numeric(_rr[_rcount], errors="coerce").fillna(0).clip(lower=0).sum()
+                    if _n > 0:
+                        return int(_n)
+            except Exception:
+                pass
+            try:
+                _count = find_column(_lr, ["Machine Count", "Number of Machines", "No. of Machines", "Machines", "Machine Qty", "Qty"])
+                return int(pd.to_numeric(_lr[_count], errors="coerce").fillna(0).clip(lower=0).sum())
+            except Exception:
+                return len(_lr)
+
+        allocation_order = sorted(selected_lines, key=lambda _x: (_estimated_slots(_x), normalize_text(_x).lower()))
+        for selected_line in allocation_order:
             result,summary=recommend_for_line(selected_line,skills,lines,eff,req,line_col,machine_col,emp_id_sk,emp_name_sk,op_sk,skill_col,emp_id_eff,efficiency_col, eligible_employee_ids=punched_employee_ids, excluded_employee_ids=already_assigned)
-            assigned_ids=set(result.loc[result["Status"]=="Recommended","Employee ID"].map(normalize_text))
+            assigned_ids=set(result.loc[result["Status"]=="Recommended","Employee ID"].map(normalize_id))
             already_assigned.update(x for x in assigned_ids if x)
             all_results.append(result)
             all_summaries.append({"Line":selected_line,**summary})
@@ -207,7 +337,7 @@ if st.session_state.get("multi_selected_lines")==list(selected_lines) and "multi
     a.metric("Selected lines",len(selected_lines))
     b.metric("Total assigned employees",int((r["Status"]=="Recommended").sum()))
     c.metric("Unfilled operator slots",int((r["Status"]=="Unfilled").sum()))
-    st.caption("Employees are allocated in the order of selected lines. Once assigned to one line, an employee is excluded from every subsequent selected line in this run.")
+    st.caption("Lines with fewer required slots are allocated first to reduce starvation. Each assigned employee is excluded from every other selected line in this run.")
     st.subheader("Line summary")
     st.dataframe(summary_df,use_container_width=True,hide_index=True)
     st.subheader("All line recommendations")

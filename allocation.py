@@ -8,6 +8,12 @@ def normalize_text(v):
         return ""
     return re.sub(r"\s+", " ", str(v)).strip()
 
+def normalize_id(v):
+    """Normalize employee IDs such as U2-0024 and U20024 to the same key."""
+    if pd.isna(v):
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", str(v).upper())
+
 def find_column(df, candidates):
     lookup = {normalize_text(c).lower(): c for c in df.columns}
     for x in candidates:
@@ -88,35 +94,51 @@ def recommend_for_line(selected_line, skills, lines, efficiency, requirements, l
         raise ValueError(f"No operator slots found for {selected_line}.")
 
     sk = skills.copy()
-    sk["_id"] = sk[skill_id_col].map(normalize_text)
+    sk["_id"] = sk[skill_id_col].map(normalize_id)
     sk["_name"] = sk[skill_name_col].map(normalize_text)
     sk["_op"] = sk[skill_op_col].map(normalize_text)
-    sk["_yes"] = sk[skill_status_col].map(is_yes)
+    # Accept both legacy YES/NO skill columns and the new numeric Skill Score format.
+    if skill_status_col in sk.columns and skill_status_col.lower().replace(" ", "") in {"skillscore", "score"}:
+        sk["_yes"] = pd.to_numeric(sk[skill_status_col], errors="coerce").fillna(0) > 0
+    else:
+        sk["_yes"] = sk[skill_status_col].map(is_yes)
     ef = efficiency.copy()
-    ef["_id"] = ef[eff_id_col].map(normalize_text)
+    ef["_id"] = ef[eff_id_col].map(normalize_id)
     ef["_eff"] = to_num(ef[eff_col])
     eff_by = ef[ef["_id"] != ""].groupby("_id")["_eff"].max()
     emp = sk[sk["_id"] != ""].drop_duplicates("_id").sort_values("_name")[["_id", "_name"]].copy()
-    emp["_eff"] = emp["_id"].map(eff_by).fillna(0).clip(0, 100)
+    emp["_eff"] = emp["_id"].map(eff_by).fillna(0)
+    # Source matrix may store efficiency as ratio (0.7922) or percent (79.22).
+    if not emp.empty and emp["_eff"].dropna().size and emp["_eff"].max() <= 1.5:
+        emp["_eff"] = emp["_eff"] * 100
+    emp["_eff"] = emp["_eff"].clip(0, 100)
     if emp.empty:
         raise ValueError("No employees found in Employee Skills.")
     if eligible_employee_ids is not None:
-        allowed = {normalize_text(x) for x in eligible_employee_ids}
+        allowed = {normalize_id(x) for x in eligible_employee_ids}
         emp = emp[emp["_id"].isin(allowed)].copy()
         if emp.empty:
             raise ValueError("No employees have punch records on the selected date. Check the punching data or choose another date.")
     # Employees assigned to an earlier selected line cannot be reused on another line.
     if excluded_employee_ids:
-        excluded = {normalize_text(x) for x in excluded_employee_ids}
+        excluded = {normalize_id(x) for x in excluded_employee_ids}
         emp = emp[~emp["_id"].isin(excluded)].copy()
     eligible = set(zip(sk.loc[sk["_yes"], "_id"], sk.loc[sk["_yes"], "_op"].str.lower()))
+    # The supplied skill matrix lists garment operations (e.g. TOP STITCH), while
+    # the machine file lists machine families (e.g. Singer, Over Lock). If there
+    # are no exact operation matches, use recorded positive skill scores as a
+    # broad fallback, and disclose that this is not operation-specific matching.
+    line_ops = {normalize_text(op).lower() for op in slots}
+    exact_match_exists = any(op in set(sk.loc[sk["_yes"], "_op"].str.lower()) for op in line_ops)
+    broad_skill_ids = set(sk.loc[sk["_yes"], "_id"]) if not exact_match_exists else set()
 
     n, m = len(emp), len(slots)
     penalty = 1e7
     cost = np.full((n + m, m), penalty, dtype=float)
     for i, (_, e) in enumerate(emp.iterrows()):
         for j, op in enumerate(slots):
-            if (e["_id"], normalize_text(op).lower()) in eligible:
+            if ((e["_id"], normalize_text(op).lower()) in eligible
+                    or (e["_id"] in broad_skill_ids)):
                 cost[i, j] = -float(e["_eff"]) + (i * 1e-8)
     cost[n:, :] = 0
     rows, cols = linear_sum_assignment(cost)
@@ -158,5 +180,8 @@ def recommend_for_line(selected_line, skills, lines, efficiency, requirements, l
         "assigned": int((result["Status"] == "Recommended").sum()),
         "unfilled": int((result["Status"] == "Unfilled").sum()),
         "machine_count": machine_count,
-        "assumption": assumption
+        "assumption": (assumption + " " if assumption else "") + (
+            "WARNING: No exact operation names matched the machine types; positive skill scores were used as a broad fallback. Confirm machine-specific qualification before production use."
+            if broad_skill_ids else ""
+        )
     }
