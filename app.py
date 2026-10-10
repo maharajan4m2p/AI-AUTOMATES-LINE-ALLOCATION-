@@ -7,7 +7,7 @@ from allocation import recommend_for_line, normalize_text, normalize_id, find_co
 
 st.set_page_config(page_title="Sewing Line AI Allocation", page_icon="🧵", layout="wide")
 st.title("🧵 Sewing Line AI Operator Allocation")
-st.caption("Upload master data once. It is saved for reuse; upload only the daily punching file for each allocation day.")
+st.caption("Master files are bundled with the app. Upload only the daily punching file for each allocation day.")
 
 def read_upload(upload):
     if upload is None: return None
@@ -18,106 +18,50 @@ def read_upload(upload):
         return pd.read_excel(upload, engine="odf")
     return pd.read_excel(upload)
 
-# Master data: bundled defaults + optional Supabase persistence.
-# Master upload controls are intentionally hidden; only daily punching is uploaded.
+# Master data is bundled with the project. No database or Supabase is required.
+# Keep these files in the repository; only the daily punching file is uploaded.
 DATA_ROOT = Path(__file__).parent / "data"
 MASTER_DIR = DATA_ROOT / "master_data"
-MASTER_DIR.mkdir(parents=True, exist_ok=True)
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-SUPABASE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "sewing-master-data").strip()
-supabase_client = None
-supabase_error = None
-if SUPABASE_URL and SUPABASE_KEY:
-    try:
-        from supabase import create_client
-        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    except Exception as exc:
-        supabase_error = str(exc)
 
 MASTER_FILES = {
-    "employee": ("Employee Details Master", "employee_details", "Employee_Details_Master.xlsx"),
-    "skills": ("Employee Skills / Operation Skill Matrix", "employee_skills", "01_Employee_Skills.xlsx"),
-    "lines": ("Line Machine Details", "line_machine_details", "02_Line_Machine_Details.xlsx"),
-    "eff": ("Employee Efficiency", "employee_efficiency", "03_Employee_Efficiency.xlsx"),
-    "req": ("Staffing Requirements (optional)", "staffing_requirements", "04_Staffing_Requirements.xlsx"),
+    "employee": ("Employee Details Master", ["Employee_Details_Master.xlsx", "EMP DETAILS.xlsx"]),
+    "skills": ("Employee Skills / Operation Skill Matrix", ["01_Employee_Skills.xlsx", "Employee_Skill_Data.xlsx", "Employee_Skill.xlsx", "Employee_Skills.xlsx"]),
+    "lines": ("Line Machine Details", ["02_Line_Machine_Details.xlsx", "Line_Machine_Details_Converted.xlsx", "Line_Machine_Details.xlsx"]),
+    "eff": ("Employee Efficiency", ["03_Employee_Efficiency.xlsx", "Employee_Efficiency_Data.xlsx", "Employee_Efficiency.xlsx"]),
+    "req": ("Staffing Requirements (optional)", ["04_Staffing_Requirements.xlsx"]),
 }
 
-def _parse_master_bytes(data, filename):
-    lower = filename.lower()
-    if lower.endswith(".csv"):
-        return pd.read_csv(BytesIO(data))
-    if lower.endswith(".ods"):
-        return pd.read_excel(BytesIO(data), engine="odf")
-    return pd.read_excel(BytesIO(data))
-
-def _remote_download(key):
-    if supabase_client is None:
-        return None
-    stem = MASTER_FILES[key][1]
-    try:
-        listing = supabase_client.storage.from_(SUPABASE_BUCKET).list()
-        match = next((item for item in listing if str(item.get("name", "")).startswith(stem + ".")), None)
-        if match:
-            filename = match["name"]
-            data = supabase_client.storage.from_(SUPABASE_BUCKET).download(filename)
-            return data, filename
-    except Exception:
-        return None
-    return None
+def _read_master_file(path):
+    if path.suffix.lower() == ".csv":
+        return pd.read_csv(path)
+    if path.suffix.lower() == ".ods":
+        return pd.read_excel(path, engine="odf")
+    return pd.read_excel(path)
 
 def load_saved_master(key):
-    # Cloud copy wins; otherwise local saved copy; otherwise bundled starter file.
-    remote = _remote_download(key)
-    if remote:
-        data, filename = remote
-        return _parse_master_bytes(data, filename)
-    stem = MASTER_FILES[key][1]
-    matches = list(MASTER_DIR.glob(f"{stem}.*"))
-    if matches:
-        path = matches[0]
-        return pd.read_csv(path) if path.suffix.lower() == ".csv" else pd.read_excel(path)
-    bundled = Path(__file__).parent / MASTER_FILES[key][2]
-    if bundled.exists():
-        return pd.read_excel(bundled)
-    return None
-
-def seed_bundled_masters_to_cloud():
-    if supabase_client is None:
-        return
-    bucket = supabase_client.storage.from_(SUPABASE_BUCKET)
-    try:
-        listing = bucket.list()
-    except Exception as exc:
-        st.sidebar.warning(f"Supabase bucket unavailable. Check that the private bucket '{SUPABASE_BUCKET}' exists: {exc}")
-        return
-    names = {str(item.get("name", "")) for item in listing}
-    for key, (_, stem, bundled_name) in MASTER_FILES.items():
-        target = Path(__file__).parent / bundled_name
-        if not target.exists() or any(name.startswith(stem + ".") for name in names):
+    # Search both project root and master_data; match names case-insensitively for Linux.
+    display_name, candidates = MASTER_FILES[key]
+    for root in [Path(__file__).parent, MASTER_DIR]:
+        if not root.exists():
             continue
-        try:
-            bucket.upload(
-                path=f"{stem}.xlsx",
-                file=target.read_bytes(),
-                file_options={"upsert": "true", "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
-            )
-            names.add(f"{stem}.xlsx")
-        except Exception as exc:
-            st.sidebar.warning(f"Could not initialize {MASTER_FILES[key][0]} in Supabase: {exc}")
+        existing = {p.name.lower(): p for p in root.iterdir() if p.is_file()}
+        for candidate in candidates:
+            path = existing.get(candidate.lower())
+            if path is not None:
+                try:
+                    return _read_master_file(path)
+                except Exception as exc:
+                    st.warning(f"Could not read bundled {display_name} file '{path.name}': {exc}")
+    return None
 
 with st.sidebar:
     st.header("Daily Allocation")
-    st.caption("Master data is preloaded. Upload only today's punching data.")
-    punch_file = st.file_uploader("Daily Punching Machine Data", type=["xlsx", "xls", "csv", "ods"], key="daily_punch_upload")
-    if supabase_client is None:
-        if not (SUPABASE_URL and SUPABASE_KEY):
-            st.info("Master files are bundled in this project. For persistence across Render restarts/redeployments, configure SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY and SUPABASE_STORAGE_BUCKET in Render.")
-        else:
-            st.warning(f"Supabase connection could not be initialized: {supabase_error}")
-    else:
-        seed_bundled_masters_to_cloud()
-        st.success("Cloud storage connected. Master data is saved for reuse.")
+    st.caption("Master files are bundled in this project. Upload only today's punching data.")
+    punch_file = st.file_uploader(
+        "Daily Punching Machine Data",
+        type=["xlsx", "xls", "csv", "ods"],
+        key="daily_punch_upload",
+    )
 
 punches = None
 if punch_file is not None:
@@ -179,7 +123,7 @@ def make_attendance(skills_df,punch_df,date_choice=None):
 if st.session_state["page"]=="attendance":
     st.header("📋 Attendance Details")
     if skills is None or punches is None:
-        st.warning("Upload Employee Skills and Punching Machine Data in the sidebar.")
+        st.warning("The bundled Employee Skills file or daily punching file is missing. Check the GitHub master file and upload today's punching data.")
     else:
         try:
             _,dates,latest=make_attendance(skills,punches)
@@ -201,7 +145,7 @@ if st.session_state["page"]=="attendance":
     st.stop()
 
 if any(x is None for x in [skills,lines,eff]):
-    st.info("Upload Employee Skills, Line Machine Details, and Employee Efficiency once in the sidebar. Saved master data will load automatically on future visits.")
+    st.info("Required bundled master file is missing. Check that 01_Employee_Skills.xlsx, 02_Line_Machine_Details.xlsx, and 03_Employee_Efficiency.xlsx are committed in the GitHub repository root.")
     st.markdown("**Punching Machine Data is compulsory for allocation.** Upload it to enable recommendations; only employees with punch records on the selected date can be allocated. Attendance Details can be opened separately.")
     if st.button("📋 ATTENDANCE DETAILS",use_container_width=True):
         st.session_state["page"]="attendance"; st.rerun()
@@ -237,7 +181,7 @@ if punches is not None:
             _overlap = len(_skill_ids.intersection(punched_employee_ids))
             st.info(f"Allocation date: {allocation_date}. Punch records found: {len(punched_employee_ids)} unique IDs; IDs matching the skill matrix: {_overlap}. Each employee can be assigned to only one selected line.")
             if _overlap == 0:
-                st.error("No punched employee IDs match the skill matrix. Check that today's punching file uses the same employee IDs as Employee_Skill_Data.xlsx.")
+                st.error("No punched employee IDs match the skill matrix. Check that 01_Employee_Skills.xlsx in GitHub is the correct current skill matrix and that the punching IDs use the same employee codes.")
             elif _overlap < len(punched_employee_ids):
                 st.warning(f"{len(punched_employee_ids) - _overlap} punched employee IDs do not exist in the skill matrix and cannot be allocated. Check ID formats or refresh the skill master.")
         except Exception:
