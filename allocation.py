@@ -77,12 +77,28 @@ def allocate_all_slots(slots, punches, skills, employee_master, efficiency, date
         for _,r in employee_master.iterrows():
             eid=normalize_id(r[emp_master_id_col]); name=normalize_text(r[emp_master_name_col])
             if eid and name: names[eid]=name; details[eid]={str(c):r[c] for c in employee_master.columns}
+    # Add names and job details from every available source, using normalized IDs.
+    # Master data wins; efficiency/skills/punching are fallback sources for missing names.
+    if efficiency is not None and efficiency_id_col:
+        try:
+            eff_name_col=find_column(efficiency,['Employee Name','Emp Name','Name'])
+            eff_designation_col=find_column(efficiency,['Designation','Job Title'])
+        except ValueError:
+            eff_name_col=eff_designation_col=None
+        for _,r in efficiency.iterrows():
+            eid=normalize_id(r[efficiency_id_col])
+            if not eid: continue
+            nm=normalize_text(r[eff_name_col]) if eff_name_col else ''
+            if nm and nm.lower() not in {'nan','none','null'}: names.setdefault(eid,nm)
+            if eid not in details: details[eid]={}
+            if eff_designation_col and normalize_text(r[eff_designation_col]):
+                details[eid].setdefault('Designation',r[eff_designation_col])
     if skill_id_col and skill_name_col:
         for _,r in skills.iterrows():
             eid=normalize_id(r[skill_id_col]); name=normalize_text(r[skill_name_col])
-            if eid and name: names.setdefault(eid,name)
+            if eid and name and name.lower() not in {'nan','none','null'}: names.setdefault(eid,name)
     for eid,nm in punch_names.items():
-        if nm: names.setdefault(eid,nm)
+        if nm and nm.lower() not in {'nan','none','null'}: names.setdefault(eid,nm)
 
     skill_rows=skills.copy() if skills is not None else pd.DataFrame()
     if not skill_rows.empty and skill_id_col:
@@ -154,11 +170,12 @@ def allocate_all_slots(slots, punches, skills, employee_master, efficiency, date
         output.append({
             'Line':slot['Line'],'Machine Type':slot['Machine Type'],'Operation':slot['Operation'],
             'Machine Slot':slot['Machine Slot'],'Machine Serial Number':slot['Machine Serial Number'],
-            'Employee Name':names.get(eid,''),'Employee ID':eid,'Department':normalize_text(d.get('Department','')),
+            'Employee Name':names.get(eid,'Name not found in master data') if eid else '',
+            'Employee ID':eid,'Department':normalize_text(d.get('Department','')),
             'Designation':normalize_text(d.get('Designation','')),'Employment Status':normalize_text(d.get('Status','')),
-            'Avg Efficiency (%)':round(float(efmap.get(eid,0) or 0),2) if eid else None,
+            'Avg Efficiency (%)':round(float(efmap[eid]),2) if eid and eid in efmap and pd.notna(efmap[eid]) else None,
             'Skill Verification Status':status,'Status':'Allocated' if eid else 'Unfilled','Reason':reason
         })
     result=pd.DataFrame(output)
     assigned_count=int((result['Status']=='Allocated').sum()) if not result.empty else 0
-    return result, {'required_slots':len(slots),'assigned':assigned_count,'unfilled':int(len(slots)-assigned_count),'provisional':int(result['Skill Verification Status'].astype(str).str.startswith('Assigned - Verify').sum()) if not result.empty else 0,'verified':int((result['Skill Verification Status']=='Recommended').sum()) if not result.empty else 0,'note':capacity_note or 'All slots allocated without duplicating employee IDs. Provisional assignments require supervisor skill verification.'}
+    return result, {'required_slots':len(slots),'assigned':assigned_count,'unfilled':int(len(slots)-assigned_count),'provisional':int(result['Skill Verification Status'].astype(str).str.startswith('Assigned - Verify').sum()) if not result.empty else 0,'verified':int((result['Skill Verification Status']=='Recommended').sum()) if not result.empty else 0,'note':capacity_note or 'Assignments are unique by employee ID. Any provisional assignment requires supervisor skill verification before production use.'}

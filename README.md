@@ -25,3 +25,11 @@ streamlit run app.py
 - The `Machine Register` sheet has one row per machine slot from the line-count master. If the supplied inventory has no serial number for a slot, it says `Not recorded in machine inventory`; do not treat this as a real serial number.
 - The `Machine Skill Mapping` sheet is a template. Add only factory-approved skill-operation mappings.
 - The app may assign provisional employees to reduce unfilled slots, but provisional assignment is not proof of qualification. Verify before the operator runs the machine.
+
+
+## Employee details and name matching
+- Employee IDs are normalized before matching (for example, `U2-0024` and `U20024` are treated as the same ID).
+- Employee names are sourced in this order: employee master, efficiency file, skill file, then daily punching data.
+- Efficiency is shown as blank when no matching efficiency record exists; it is not falsely shown as 0%.
+- If a name is absent from all supplied sources, the report explicitly says `Name not found in master data` instead of pretending the employee ID is a name.
+- Department and employment status come from the employee master; designation can fall back to the efficiency file.
