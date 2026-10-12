@@ -1,9 +1,27 @@
-# Sewing Line AI Operator Allocation (No Supabase)
+# Sewing Line AI Operator Allocation — Serial Number Edition
 
-## Deploy
-1. Upload/commit all files in this folder to the GitHub repository root.
-2. Ensure `app.py`, `allocation.py`, `01_Employee_Skills.xlsx`, `02_Line_Machine_Details.xlsx`, `03_Employee_Efficiency.xlsx`, and `Employee_Details_Master.xlsx` are committed.
-3. Render should install packages from `requirements.txt` and run `streamlit run app.py`.
-4. Each day, upload only the daily punching file (`.xlsx`, `.xls`, `.csv`, or `.ods`) in the app.
+## Features
+- Upload only the daily punching file (.xlsx, .xls, .csv, .ods).
+- Master employee/skill/efficiency files are bundled; no Supabase required.
+- Uses `02_Line_Machine_Details.xlsx` → `Machine Register` as the source of physical machine slots.
+- One employee per machine slot and no employee duplication across selected lines.
+- Outputs employee name, ID, efficiency, machine serial number, line, operation, and qualification verification status.
+- Shows separate line tabs and CSV/Excel downloads.
+- Provisional assignments are visibly flagged when skill records or approved machine-to-skill mappings are not verified. A supervisor must verify them before production use.
 
-Master workbooks are read from the repository bundle. No Supabase account, URL, key, or bucket is required. To update master data, replace the corresponding workbook in GitHub and redeploy.
+## Run locally
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+## Deploy on Render
+1. Upload/replace the project files in the GitHub repository root.
+2. Keep the Excel master files in the repository root.
+3. Commit the changes.
+4. In Render, deploy the latest commit.
+
+## Important
+- The `Machine Register` sheet has one row per machine slot from the line-count master. If the supplied inventory has no serial number for a slot, it says `Not recorded in machine inventory`; do not treat this as a real serial number.
+- The `Machine Skill Mapping` sheet is a template. Add only factory-approved skill-operation mappings.
+- The app may assign provisional employees to reduce unfilled slots, but provisional assignment is not proof of qualification. Verify before the operator runs the machine.

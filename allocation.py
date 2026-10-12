@@ -4,184 +4,161 @@ import pandas as pd
 from scipy.optimize import linear_sum_assignment
 
 def normalize_text(v):
-    if pd.isna(v):
-        return ""
+    if pd.isna(v): return ""
     return re.sub(r"\s+", " ", str(v)).strip()
 
 def normalize_id(v):
-    """Normalize employee IDs such as U2-0024 and U20024 to the same key."""
-    if pd.isna(v):
-        return ""
-    return re.sub(r"[^A-Z0-9]", "", str(v).upper())
+    if pd.isna(v): return ""
+    s=str(v).strip().upper()
+    # Excel sometimes reads IDs as numeric floats; preserve alphanumeric IDs and remove separators.
+    if re.fullmatch(r"\d+\.0", s): s=s[:-2]
+    return re.sub(r"[^A-Z0-9]", "", s)
 
 def find_column(df, candidates):
-    lookup = {normalize_text(c).lower(): c for c in df.columns}
+    lookup={normalize_text(c).lower():c for c in df.columns}
     for x in candidates:
-        if normalize_text(x).lower() in lookup:
-            return lookup[normalize_text(x).lower()]
-    def compact(x):
-        return re.sub(r"[^a-z0-9]", "", normalize_text(x).lower())
-    lookup2 = {compact(c): c for c in df.columns}
+        if normalize_text(x).lower() in lookup: return lookup[normalize_text(x).lower()]
+    def compact(x): return re.sub(r"[^a-z0-9]", "", normalize_text(x).lower())
+    lookup2={compact(c):c for c in df.columns}
     for x in candidates:
-        if compact(x) in lookup2:
-            return lookup2[compact(x)]
-    raise ValueError("Could not find columns: " + ", ".join(candidates) + ". Available columns: " + ", ".join(map(str, df.columns)))
-
-def is_yes(v):
-    return normalize_text(v).lower() in {"yes", "y", "true", "1", "skilled"}
+        if compact(x) in lookup2: return lookup2[compact(x)]
+    raise ValueError("Could not find columns: "+", ".join(candidates)+". Available columns: "+", ".join(map(str,df.columns)))
 
 def to_num(s):
-    return pd.to_numeric(s.astype(str).str.replace("%", "", regex=False).str.replace(",", "", regex=False).str.strip(), errors="coerce")
+    return pd.to_numeric(s.astype(str).str.replace('%','',regex=False).str.replace(',','',regex=False).str.strip(),errors='coerce')
 
-def recommend_for_line(selected_line, skills, lines, efficiency, requirements, line_col, machine_col, skill_id_col, skill_name_col, skill_op_col, skill_status_col, eff_id_col, eff_col, eligible_employee_ids=None, excluded_employee_ids=None):
-    target = normalize_text(selected_line).lower()
-    line_rows = lines[lines[line_col].map(lambda x: normalize_text(x).lower()) == target].copy()
-    line_rows = line_rows[line_rows[machine_col].notna()]
-    if line_rows.empty:
-        raise ValueError(f"No machine details found for {selected_line}.")
+def is_positive_skill(v):
+    n=pd.to_numeric(pd.Series([v]),errors='coerce').iloc[0]
+    if pd.notna(n): return n>0
+    return normalize_text(v).lower() in {'yes','y','true','1','skilled'}
 
-    # Each physical machine row or Machine Count contributes to the displayed machine total.
-    machine_id_col = None
-    count_col = None
-    for candidates in (["Machine ID", "Machine No", "Machine Number", "Equipment ID"],):
-        try:
-            machine_id_col = find_column(line_rows, candidates)
-        except ValueError:
-            pass
-    try:
-        count_col = find_column(line_rows, ["Machine Count", "Number of Machines", "No. of Machines", "Machines", "Machine Qty", "Qty"])
-    except ValueError:
-        pass
+def build_machine_slots(lines, selected_lines, line_col, machine_col, serial_col=None, count_col=None):
+    slots=[]
+    for line in selected_lines:
+        lr=lines[lines[line_col].map(lambda x:normalize_text(x).lower())==normalize_text(line).lower()].copy()
+        for _,row in lr.iterrows():
+            typ=normalize_text(row[machine_col])
+            if not typ: continue
+            count=pd.to_numeric(row[count_col],errors='coerce') if count_col else 1
+            count=int(count) if pd.notna(count) else 0
+            count=max(0,count)
+            serials=[]
+            if serial_col and pd.notna(row.get(serial_col,'')):
+                serials=[x.strip() for x in str(row[serial_col]).split(',') if x.strip() and x.strip().lower()!='nan']
+            for i in range(count):
+                serial=serials[i] if i<len(serials) else 'Not recorded in machine inventory'
+                slots.append({'Line':line,'Operation':typ,'Machine Slot':i+1,'Machine Serial Number':serial,'Machine Type':typ})
+    return slots
 
-    if count_col:
-        line_rows["_machine_count"] = pd.to_numeric(line_rows[count_col], errors="coerce").fillna(0).clip(lower=0)
-        machine_count = int(line_rows["_machine_count"].sum())
-        machine_counts = line_rows.groupby(line_rows[machine_col].map(normalize_text))["_machine_count"].sum().to_dict()
-    elif machine_id_col:
-        line_rows["_machine_count"] = 1
-        machine_count = len(line_rows)
-        machine_counts = line_rows.groupby(line_rows[machine_col].map(normalize_text))["_machine_count"].sum().to_dict()
+def allocate_all_slots(slots, punches, skills, employee_master, efficiency, date_ids, punch_id_col, punch_name_col=None,
+                       skill_id_col=None, skill_name_col=None, skill_op_col=None, skill_score_col=None,
+                       emp_master_id_col=None, emp_master_name_col=None, efficiency_id_col=None, efficiency_col=None,
+                       approved_mapping=None):
+    """Fill every machine slot if there are enough distinct punched IDs.
+
+    Skill-qualified candidates are ranked first. When the source data has no verified machine-to-operation
+    mapping or a worker has no skill row, a provisional allocation is made so the slot is not left empty;
+    the report explicitly marks that assignment as requiring skill verification.
+    """
+    # Build punch roster for selected date; caller has already filtered the punch frame.
+    pn=punches.copy()
+    pn['_id']=pn[punch_id_col].map(normalize_id)
+    pn=pn[pn['_id']!=''].drop_duplicates('_id',keep='first')
+    punch_names={}
+    if punch_name_col:
+        punch_names={normalize_id(r[punch_id_col]):normalize_text(r[punch_name_col]) for _,r in pn.iterrows() if normalize_id(r[punch_id_col])}
+    ids=set(date_ids) if date_ids is not None else set(pn['_id'])
+    pn=pn[pn['_id'].isin(ids)]
+    punch_names={normalize_id(r[punch_id_col]):normalize_text(r[punch_name_col]) for _,r in pn.iterrows() if punch_name_col and normalize_id(r[punch_id_col]) and normalize_text(r[punch_name_col])}
+    if not ids: return pd.DataFrame(), {'required_slots':len(slots),'assigned':0,'unfilled':len(slots),'note':'No punched employees found for the selected date.'}
+
+    names={}; details={}
+    if employee_master is not None and emp_master_id_col and emp_master_name_col:
+        for _,r in employee_master.iterrows():
+            eid=normalize_id(r[emp_master_id_col]); name=normalize_text(r[emp_master_name_col])
+            if eid and name: names[eid]=name; details[eid]={str(c):r[c] for c in employee_master.columns}
+    if skill_id_col and skill_name_col:
+        for _,r in skills.iterrows():
+            eid=normalize_id(r[skill_id_col]); name=normalize_text(r[skill_name_col])
+            if eid and name: names.setdefault(eid,name)
+    for eid,nm in punch_names.items():
+        if nm: names.setdefault(eid,nm)
+
+    skill_rows=skills.copy() if skills is not None else pd.DataFrame()
+    if not skill_rows.empty and skill_id_col:
+        skill_rows['_id']=skill_rows[skill_id_col].map(normalize_id)
+        skill_rows['_positive']=skill_rows[skill_score_col].map(is_positive_skill) if skill_score_col else False
     else:
-        line_rows["_machine_count"] = 1
-        machine_counts = line_rows.groupby(line_rows[machine_col].map(normalize_text)).size().to_dict()
-        machine_count = len(line_rows)
+        skill_rows=pd.DataFrame(columns=['_id','_positive'])
+    positive_ids=set(skill_rows.loc[skill_rows['_positive']==True,'_id']) if not skill_rows.empty else set()
+    # Machine family exact mappings are only considered verified when explicitly supplied in the workbook.
+    map_by_machine={}
+    if approved_mapping is not None and not approved_mapping.empty:
+        mc=find_column(approved_mapping,['Machine Type'])
+        sc=find_column(approved_mapping,['Approved Skill Operation','Skill Operation'])
+        for _,r in approved_mapping.iterrows():
+            mt=normalize_text(r[mc]).lower(); so=normalize_text(r[sc]).lower()
+            if mt and so: map_by_machine.setdefault(mt,set()).add(so)
+    skill_ops={}
+    if not skill_rows.empty and skill_op_col:
+        for eid,group in skill_rows[skill_rows['_positive']].groupby('_id'):
+            skill_ops[eid]={normalize_text(x).lower() for x in group[skill_op_col] if normalize_text(x)}
 
-    ops = sorted([op for op in machine_counts if normalize_text(op)], key=str.lower)
-    slots = []
-    assumption = None
-    if requirements is not None:
-        rline = find_column(requirements, ["Line", "Candidate Line"])
-        rop = find_column(requirements, ["Operation", "Machine Type", "Required Operation"])
-        rcount = find_column(requirements, ["Operators Required", "Required Operators", "Operator Count", "Slots"])
-        rr = requirements[requirements[rline].map(lambda x: normalize_text(x).lower()) == target].copy()
-        if not rr.empty:
-            for _, row in rr.iterrows():
-                op = normalize_text(row[rop])
-                count = pd.to_numeric(row[rcount], errors="coerce")
-                if op and pd.notna(count) and count > 0:
-                    # Keep one slot per required operator; machine count is added as context in output.
-                    slots.extend([op] * int(count))
-        if not slots:
-            for op in ops:
-                slots.extend([op] * int(machine_counts.get(op, 1)))
-            assumption = "No matching staffing requirement found; using machine count as a fallback for operator slots."
-    else:
-        for op in ops:
-            slots.extend([op] * int(machine_counts.get(op, 1)))
-        assumption = "No staffing file supplied; using one operator per machine as a fallback. Confirm actual staffing requirements."
+    efmap={}
+    if efficiency is not None and efficiency_id_col and efficiency_col:
+        ef=efficiency.copy(); ef['_id']=ef[efficiency_id_col].map(normalize_id); ef['_eff']=to_num(ef[efficiency_col])
+        if not ef.empty and ef['_eff'].dropna().size and ef['_eff'].max()<=1.5: ef['_eff']=ef['_eff']*100
+        ef['_eff']=ef['_eff'].clip(0,100)
+        efmap=ef[ef['_id']!=''].groupby('_id')['_eff'].max().to_dict()
 
-    if not slots:
-        raise ValueError(f"No operator slots found for {selected_line}.")
-
-    sk = skills.copy()
-    sk["_id"] = sk[skill_id_col].map(normalize_id)
-    sk["_name"] = sk[skill_name_col].map(normalize_text)
-    sk["_op"] = sk[skill_op_col].map(normalize_text)
-    # Accept both legacy YES/NO skill columns and the new numeric Skill Score format.
-    if skill_status_col in sk.columns and skill_status_col.lower().replace(" ", "") in {"skillscore", "score"}:
-        sk["_yes"] = pd.to_numeric(sk[skill_status_col], errors="coerce").fillna(0) > 0
-    else:
-        sk["_yes"] = sk[skill_status_col].map(is_yes)
-    ef = efficiency.copy()
-    ef["_id"] = ef[eff_id_col].map(normalize_id)
-    ef["_eff"] = to_num(ef[eff_col])
-    eff_by = ef[ef["_id"] != ""].groupby("_id")["_eff"].max()
-    emp = sk[sk["_id"] != ""].drop_duplicates("_id").sort_values("_name")[["_id", "_name"]].copy()
-    emp["_eff"] = emp["_id"].map(eff_by).fillna(0)
-    # Source matrix may store efficiency as ratio (0.7922) or percent (79.22).
-    if not emp.empty and emp["_eff"].dropna().size and emp["_eff"].max() <= 1.5:
-        emp["_eff"] = emp["_eff"] * 100
-    emp["_eff"] = emp["_eff"].clip(0, 100)
-    if emp.empty:
-        raise ValueError("No employees found in Employee Skills.")
-    if eligible_employee_ids is not None:
-        allowed = {normalize_id(x) for x in eligible_employee_ids}
-        emp = emp[emp["_id"].isin(allowed)].copy()
-        if emp.empty:
-            raise ValueError("No employees have punch records on the selected date. Check the punching data or choose another date.")
-    # Employees assigned to an earlier selected line cannot be reused on another line.
-    if excluded_employee_ids:
-        excluded = {normalize_id(x) for x in excluded_employee_ids}
-        emp = emp[~emp["_id"].isin(excluded)].copy()
-    eligible = set(zip(sk.loc[sk["_yes"], "_id"], sk.loc[sk["_yes"], "_op"].str.lower()))
-    # The supplied skill matrix lists garment operations (e.g. TOP STITCH), while
-    # the machine file lists machine families (e.g. Singer, Over Lock). If there
-    # are no exact operation matches, use recorded positive skill scores as a
-    # broad fallback, and disclose that this is not operation-specific matching.
-    line_ops = {normalize_text(op).lower() for op in slots}
-    exact_match_exists = any(op in set(sk.loc[sk["_yes"], "_op"].str.lower()) for op in line_ops)
-    broad_skill_ids = set(sk.loc[sk["_yes"], "_id"]) if not exact_match_exists else set()
-
-    n, m = len(emp), len(slots)
-    penalty = 1e7
-    cost = np.full((n + m, m), penalty, dtype=float)
-    for i, (_, e) in enumerate(emp.iterrows()):
-        for j, op in enumerate(slots):
-            if ((e["_id"], normalize_text(op).lower()) in eligible
-                    or (e["_id"] in broad_skill_ids)):
-                cost[i, j] = -float(e["_eff"]) + (i * 1e-8)
-    cost[n:, :] = 0
-    rows, cols = linear_sum_assignment(cost)
-    assigned = {j: i for i, j in zip(rows, cols) if i < n and cost[i, j] < penalty}
-
-    # Machine count by operation, and a stable machine slot number for readable output.
-    op_slot_numbers = {}
-    output = []
-    for j, op in enumerate(slots):
-        op_slot_numbers[op] = op_slot_numbers.get(op, 0) + 1
-        if j in assigned:
-            e = emp.iloc[assigned[j]]
-            output.append({
-                "Line": selected_line,
-                "Operation": op,
-                "Machines for Operation": int(machine_counts.get(op, 0)),
-                "Operator Slot": op_slot_numbers[op],
-                "Employee Name": e["_name"],
-                "Employee ID": e["_id"],
-                "Avg Efficiency (%)": round(float(e["_eff"]), 2),
-                "Status": "Recommended",
-                "Reason": "Qualified for this operation; ranked using average efficiency."
-            })
+    candidates=sorted(ids)
+    if len(candidates)<len(slots):
+        # Cannot produce duplicate IDs; report genuine capacity limit.
+        capacity_note=f'Only {len(candidates)} distinct employees punched in for {len(slots)} machine slots. {len(slots)-len(candidates)} slots cannot be filled without duplicate employees or another worker.'
+    else: capacity_note=''
+    # Cost: explicit approved skill mapping first, then employees with a skill record, then employees without a skill record.
+    # Efficiency breaks ties; all candidate/slot pairs remain assignable so every slot can be staffed provisionally.
+    n_slots=len(slots); n_emp=len(candidates)
+    cost=np.zeros((n_slots,n_emp),dtype=float)
+    for i,slot in enumerate(slots):
+        mt=normalize_text(slot['Machine Type']).lower()
+        approved=map_by_machine.get(mt,set())
+        for j,eid in enumerate(candidates):
+            ops=skill_ops.get(eid,set())
+            if approved and ops.intersection(approved):
+                tier=0; qual='Verified mapping match'
+            elif eid in positive_ids:
+                tier=1000; qual='Provisional - machine skill mapping not verified'
+            else:
+                tier=100000; qual='Provisional - missing positive skill record'
+            eff=float(efmap.get(eid,0) or 0)
+            # stable deterministic tie break
+            cost[i,j]=tier-eff*0.01+j*1e-7
+    rows,cols=linear_sum_assignment(cost)
+    assigned={int(i):candidates[int(j)] for i,j in zip(rows,cols)}
+    output=[]
+    for i,slot in enumerate(slots):
+        eid=assigned.get(i,'')
+        ops=skill_ops.get(eid,set())
+        approved=map_by_machine.get(normalize_text(slot['Machine Type']).lower(),set())
+        if eid and approved and ops.intersection(approved):
+            status='Recommended'; reason='Matched an explicitly approved machine-to-skill mapping.'
+        elif eid in positive_ids:
+            status='Assigned - Verify skill'; reason='Employee has a positive skill record, but this machine type has no verified matching operation mapping.'
+        elif eid:
+            status='Assigned - Verify qualification'; reason='No positive skill record found; supervisor must verify qualification before operating this machine.'
         else:
-            output.append({
-                "Line": selected_line,
-                "Operation": op,
-                "Machines for Operation": int(machine_counts.get(op, 0)),
-                "Operator Slot": op_slot_numbers[op],
-                "Employee Name": "",
-                "Employee ID": "",
-                "Avg Efficiency (%)": None,
-                "Status": "Unfilled",
-                "Reason": "No eligible unassigned employee available for this operator slot."
-            })
-    result = pd.DataFrame(output)
-    return result, {
-        "required_slots": len(slots),
-        "assigned": int((result["Status"] == "Recommended").sum()),
-        "unfilled": int((result["Status"] == "Unfilled").sum()),
-        "machine_count": machine_count,
-        "assumption": (assumption + " " if assumption else "") + (
-            "WARNING: No exact operation names matched the machine types; positive skill scores were used as a broad fallback. Confirm machine-specific qualification before production use."
-            if broad_skill_ids else ""
-        )
-    }
+            status='Unfilled'; reason='No distinct punched employee available.'
+        d=details.get(eid,{})
+        # Pull available worker details, never fabricate missing values.
+        output.append({
+            'Line':slot['Line'],'Machine Type':slot['Machine Type'],'Operation':slot['Operation'],
+            'Machine Slot':slot['Machine Slot'],'Machine Serial Number':slot['Machine Serial Number'],
+            'Employee Name':names.get(eid,''),'Employee ID':eid,'Department':normalize_text(d.get('Department','')),
+            'Designation':normalize_text(d.get('Designation','')),'Employment Status':normalize_text(d.get('Status','')),
+            'Avg Efficiency (%)':round(float(efmap.get(eid,0) or 0),2) if eid else None,
+            'Skill Verification Status':status,'Status':'Allocated' if eid else 'Unfilled','Reason':reason
+        })
+    result=pd.DataFrame(output)
+    assigned_count=int((result['Status']=='Allocated').sum()) if not result.empty else 0
+    return result, {'required_slots':len(slots),'assigned':assigned_count,'unfilled':int(len(slots)-assigned_count),'provisional':int(result['Skill Verification Status'].astype(str).str.startswith('Assigned - Verify').sum()) if not result.empty else 0,'verified':int((result['Skill Verification Status']=='Recommended').sum()) if not result.empty else 0,'note':capacity_note or 'All slots allocated without duplicating employee IDs. Provisional assignments require supervisor skill verification.'}
